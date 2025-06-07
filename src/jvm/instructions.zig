@@ -377,6 +377,9 @@ pub fn getInstructionInfo(opcode: Opcode) InstructionInfo {
         .checkcast => .{ .opcode = .checkcast, .name = "checkcast", .operand_count = 2, .stack_effect = 0, .category = .object },
         .instanceof => .{ .opcode = .instanceof, .name = "instanceof", .operand_count = 2, .stack_effect = 0, .category = .object },
 
+        // 调试指令
+        .breakpoint => .{ .opcode = .breakpoint, .name = "breakpoint", .operand_count = 0, .stack_effect = 0, .category = .reserved },
+
         else => .{ .opcode = opcode, .name = "unknown", .operand_count = 0, .stack_effect = 0, .category = .reserved },
     };
 }

@@ -667,6 +667,159 @@ const MethodParser = struct {
         const name = try self.getMethodName(method);
         return std.mem.eql(u8, name, "<clinit>");
     }
+
+    /// 修复main方法签名
+    fn fixMainMethodSignature(self: *MethodParser, method_name: []const u8, descriptor: []const u8) ![]const u8 {
+        if (std.mem.eql(u8, method_name, "main") and std.mem.eql(u8, descriptor, "([Ljava/lang/String;)V")) {
+            return try self.allocator.dupe(u8, "public static void main(String[] args)");
+        }
+        return try self.allocator.dupe(u8, descriptor);
+    }
+
+    /// 生成参数名称
+    fn generateParameterNames(self: *MethodParser, param_types: []const ParameterInfo) ![][]const u8 {
+        var names = ArrayList([]const u8).init(self.allocator);
+
+        for (param_types, 0..) |param, i| {
+            const base_name = switch (param.type) {
+                .reference => if (param.class_name) |class_name| blk: {
+                    if (std.mem.endsWith(u8, class_name, "String")) {
+                        break :blk "str";
+                    } else if (std.mem.endsWith(u8, class_name, "Object")) {
+                        break :blk "obj";
+                    } else {
+                        // 提取类名的最后部分
+                        const last_slash = std.mem.lastIndexOf(u8, class_name, "/");
+                        const simple_name = if (last_slash) |idx| class_name[idx + 1 ..] else class_name;
+                        break :blk try std.ascii.allocLowerString(self.allocator, simple_name[0..@min(3, simple_name.len)]);
+                    }
+                } else "obj",
+                .int => "i",
+                .long => "l",
+                .float => "f",
+                .double => "d",
+                .boolean => "flag",
+                .array => "arr",
+                .byte => "b",
+                .char => "c",
+                .short => "s",
+                .void => "void",
+            };
+
+            const numbered_name = if (i == 0)
+                try self.allocator.dupe(u8, base_name)
+            else
+                try std.fmt.allocPrint(self.allocator, "{s}{}", .{ base_name, i });
+
+            try names.append(numbered_name);
+        }
+
+        return try names.toOwnedSlice();
+    }
+
+    /// 生成改进的方法签名字符串
+    fn generateMethodSignatureString(self: *MethodParser, method: *const MethodInfo) ![]const u8 {
+        const method_name = try self.getMethodName(method);
+        const descriptor = try self.constant_pool.getUtf8String(method.descriptor_index);
+
+        // 特殊处理main方法
+        if (std.mem.eql(u8, method_name, "main") and method.access_flags & 0x0008 != 0) {
+            return try self.fixMainMethodSignature(method_name, descriptor);
+        }
+
+        // 解析方法签名
+        var signature = try self.parseMethodDescriptor(descriptor);
+        defer signature.deinit();
+
+        // 生成参数名
+        const param_names = try self.generateParameterNames(signature.parameters.items);
+        defer {
+            for (param_names) |name| {
+                self.allocator.free(name);
+            }
+            self.allocator.free(param_names);
+        }
+
+        var result = ArrayList(u8).init(self.allocator);
+        defer result.deinit();
+
+        // 访问修饰符
+        if (method.access_flags & 0x0001 != 0) try result.appendSlice("public ");
+        if (method.access_flags & 0x0002 != 0) try result.appendSlice("private ");
+        if (method.access_flags & 0x0004 != 0) try result.appendSlice("protected ");
+        if (method.access_flags & 0x0008 != 0) try result.appendSlice("static ");
+        if (method.access_flags & 0x0010 != 0) try result.appendSlice("final ");
+
+        // 处理构造函数
+        if (std.mem.eql(u8, method_name, "<init>")) {
+            // 构造函数，需要类名（暂时使用占位符）
+            try result.appendSlice("Constructor");
+        } else {
+            // 返回类型
+            const return_type_str = try self.javaTypeToString(signature.return_type);
+            defer self.allocator.free(return_type_str);
+            try result.appendSlice(return_type_str);
+            try result.append(' ');
+            try result.appendSlice(method_name);
+        }
+
+        // 参数列表
+        try result.append('(');
+        for (signature.parameters.items, 0..) |param, i| {
+            if (i > 0) try result.appendSlice(", ");
+
+            const param_type_str = try self.javaTypeToString(param);
+            defer self.allocator.free(param_type_str);
+            try result.appendSlice(param_type_str);
+            try result.append(' ');
+            try result.appendSlice(param_names[i]);
+        }
+        try result.append(')');
+
+        return try result.toOwnedSlice();
+    }
+
+    /// 将Java类型转换为字符串
+    fn javaTypeToString(self: *MethodParser, param: ParameterInfo) ![]const u8 {
+        var result = ArrayList(u8).init(self.allocator);
+        defer result.deinit();
+
+        // 处理数组维度
+        const base_type_str = switch (param.type) {
+            .byte => "byte",
+            .char => "char",
+            .double => "double",
+            .float => "float",
+            .int => "int",
+            .long => "long",
+            .short => "short",
+            .boolean => "boolean",
+            .void => "void",
+            .reference => if (param.class_name) |class_name| blk: {
+                // 简化类名
+                if (std.mem.eql(u8, class_name, "java/lang/String")) {
+                    break :blk "String";
+                } else if (std.mem.eql(u8, class_name, "java/lang/Object")) {
+                    break :blk "Object";
+                } else {
+                    // 提取简单类名
+                    const last_slash = std.mem.lastIndexOf(u8, class_name, "/");
+                    break :blk if (last_slash) |idx| class_name[idx + 1 ..] else class_name;
+                }
+            } else "Object",
+            .array => "Object", // 数组的基础类型会在下面处理
+        };
+
+        try result.appendSlice(base_type_str);
+
+        // 添加数组括号
+        var i: u8 = 0;
+        while (i < param.array_dimensions) : (i += 1) {
+            try result.appendSlice("[]");
+        }
+
+        return try result.toOwnedSlice();
+    }
 };
 
 // 导出公共接口

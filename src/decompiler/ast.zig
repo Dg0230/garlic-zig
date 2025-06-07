@@ -87,6 +87,8 @@ pub const BinaryOp = enum {
     shl, // <<
     shr, // >>
     ushr, // >>>
+    assign, // =
+    cmp, // 比较操作
 
     /// 获取操作符的字符串表示
     pub fn toString(self: BinaryOp) []const u8 {
@@ -106,6 +108,8 @@ pub const BinaryOp = enum {
             .ge => ">=",
             .bit_and => "&",
             .bit_or => "|",
+            .assign => "=",
+            .cmp => "cmp",
             .bit_xor => "^",
             .shl => "<<",
             .shr => ">>",
@@ -119,6 +123,7 @@ pub const UnaryOp = enum {
     neg, // -
     not, // !
     bit_not, // ~
+    cast, // 类型转换
 
     /// 获取操作符的字符串表示
     pub fn toString(self: UnaryOp) []const u8 {
@@ -126,6 +131,7 @@ pub const UnaryOp = enum {
             .neg => "-",
             .not => "!",
             .bit_not => "~",
+            .cast => "(cast)",
         };
     }
 };
@@ -295,6 +301,16 @@ pub const ASTBuilder = struct {
         return node;
     }
 
+    /// 创建整数字面量节点
+    pub fn createIntLiteral(self: *ASTBuilder, value: i64) !*ASTNode {
+        return self.createLiteral(.{ .int_val = value }, .int);
+    }
+
+    /// 创建字符串字面量节点
+    pub fn createStringLiteral(self: *ASTBuilder, value: []const u8) !*ASTNode {
+        return self.createLiteral(.{ .string_val = value }, .object);
+    }
+
     /// 创建标识符节点
     pub fn createIdentifier(self: *ASTBuilder, name: []const u8) !*ASTNode {
         const node = try ASTNode.init(self.allocator, .identifier);
@@ -322,8 +338,8 @@ pub const ASTBuilder = struct {
         return node;
     }
 
-    /// 创建方法调用节点
-    pub fn createMethodCall(self: *ASTBuilder, method_name: []const u8, class_name: ?[]const u8, is_static: bool) !*ASTNode {
+    /// 创建方法调用节点（带名称）
+    pub fn createMethodCallByName(self: *ASTBuilder, method_name: []const u8, class_name: ?[]const u8, is_static: bool) !*ASTNode {
         const node = try ASTNode.init(self.allocator, .method_call);
         node.data = .{ .method_call = MethodCallData{
             .method_name = method_name,
@@ -366,21 +382,87 @@ pub const ASTBuilder = struct {
         return node;
     }
 
-    /// 创建代码块节点
-    pub fn createBlock(self: *ASTBuilder) !*ASTNode {
+    /// 创建方法声明节点
+    pub fn createMethodDeclaration(self: *ASTBuilder, name: []const u8, return_type: []const u8, parameters: []const u8, access_flags: u16) !*ASTNode {
+        const node = try ASTNode.init(self.allocator, .method_decl);
+        // 简化实现，实际需要更复杂的方法数据结构
+        _ = name;
+        _ = return_type;
+        _ = parameters;
+        _ = access_flags;
+        try self.nodes.append(node);
+        return node;
+    }
+
+    /// 创建块语句节点
+    pub fn createBlockStatement(self: *ASTBuilder) !*ASTNode {
         const node = try ASTNode.init(self.allocator, .block_stmt);
         try self.nodes.append(node);
         return node;
     }
 
+    /// 创建代码块节点（别名）
+    pub fn createBlock(self: *ASTBuilder) !*ASTNode {
+        return self.createBlockStatement();
+    }
+
     /// 创建返回语句节点
-    pub fn createReturn(self: *ASTBuilder, expr: ?*ASTNode) !*ASTNode {
+    pub fn createReturnStatement(self: *ASTBuilder, expr: ?*ASTNode) !*ASTNode {
         const node = try ASTNode.init(self.allocator, .return_stmt);
         if (expr) |e| {
             try node.addChild(e);
         }
         try self.nodes.append(node);
         return node;
+    }
+
+    /// 创建返回语句节点（别名）
+    pub fn createReturn(self: *ASTBuilder, expr: ?*ASTNode) !*ASTNode {
+        return self.createReturnStatement(expr);
+    }
+
+    /// 创建表达式语句节点
+    pub fn createExpressionStatement(self: *ASTBuilder, expr: *ASTNode) !*ASTNode {
+        const node = try ASTNode.init(self.allocator, .expression_stmt);
+        try node.addChild(expr);
+        try self.nodes.append(node);
+        return node;
+    }
+
+    /// 创建方法调用节点
+    pub fn createMethodCall(self: *ASTBuilder, target: *ASTNode, args: []*ASTNode) !*ASTNode {
+        const node = try ASTNode.init(self.allocator, .method_call);
+        try node.addChild(target);
+        for (args) |arg| {
+            try node.addChild(arg);
+        }
+        try self.nodes.append(node);
+        return node;
+    }
+
+    /// 创建字段访问节点
+    pub fn createFieldAccess(self: *ASTBuilder, object: *ASTNode, field_name: []const u8) !*ASTNode {
+        const node = try ASTNode.init(self.allocator, .field_access);
+        try node.addChild(object);
+        // 简化实现，实际需要存储字段名
+        _ = field_name;
+        try self.nodes.append(node);
+        return node;
+    }
+
+    /// 创建赋值节点
+    pub fn createAssignment(self: *ASTBuilder, left: *ASTNode, right: *ASTNode) !*ASTNode {
+        const node = try ASTNode.init(self.allocator, .assignment);
+        try node.addChild(left);
+        try node.addChild(right);
+        try self.nodes.append(node);
+        return node;
+    }
+
+    /// 创建注释节点（简化实现）
+    pub fn createComment(self: *ASTBuilder, text: []const u8) !*ASTNode {
+        // 暂时用字符串字面量表示注释
+        return self.createStringLiteral(text);
     }
 
     /// 创建if语句节点
@@ -391,6 +473,48 @@ pub const ASTBuilder = struct {
         if (else_stmt) |e| {
             try node.addChild(e);
         }
+        try self.nodes.append(node);
+        return node;
+    }
+
+    /// 创建局部变量节点
+    pub fn createLocalVariable(self: *ASTBuilder, index: u8) !*ASTNode {
+        const node = try ASTNode.init(self.allocator, .identifier);
+        // 使用变量索引创建变量名
+        const var_name = try std.fmt.allocPrint(self.allocator, "var{d}", .{index});
+        node.setIdentifier(var_name);
+        try self.nodes.append(node);
+        return node;
+    }
+
+    /// 创建数组长度节点
+    pub fn createArrayLength(self: *ASTBuilder, array: *ASTNode) !*ASTNode {
+        const node = try ASTNode.init(self.allocator, .field_access);
+        try node.addChild(array);
+        try self.nodes.append(node);
+        return node;
+    }
+
+    /// 创建异常抛出节点
+    pub fn createThrow(self: *ASTBuilder, exception: *ASTNode) !*ASTNode {
+        const node = try ASTNode.init(self.allocator, .expression_stmt);
+        try node.addChild(exception);
+        try self.nodes.append(node);
+        return node;
+    }
+
+    /// 创建监视器进入节点
+    pub fn createMonitorEnter(self: *ASTBuilder, object: *ASTNode) !*ASTNode {
+        const node = try ASTNode.init(self.allocator, .expression_stmt);
+        try node.addChild(object);
+        try self.nodes.append(node);
+        return node;
+    }
+
+    /// 创建监视器退出节点
+    pub fn createMonitorExit(self: *ASTBuilder, object: *ASTNode) !*ASTNode {
+        const node = try ASTNode.init(self.allocator, .expression_stmt);
+        try node.addChild(object);
         try self.nodes.append(node);
         return node;
     }

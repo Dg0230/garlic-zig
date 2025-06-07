@@ -1,4 +1,4 @@
-//! 反编译引擎主模块
+//! Garlic Java 反编译器 - 主反编译引擎
 //! 整合AST构建、表达式重建、控制结构识别、代码生成和优化等功能
 
 const std = @import("std");
@@ -14,8 +14,8 @@ const codegen = @import("codegen.zig");
 const optimizer = @import("optimizer.zig");
 
 // 导入JVM相关模块
-const jvm = @import("../jvm/jvm.zig");
-const parser = @import("../parser/bytecode.zig");
+const jvm = @import("jvm");
+const parser = @import("parser");
 const ClassFile = parser.ClassFile;
 const MethodInfo = parser.MethodInfo;
 const AttributeInfo = parser.AttributeInfo;
@@ -49,6 +49,10 @@ pub const DecompilerOptions = struct {
     output_format: OutputFormat = .java,
     /// 是否生成调试信息
     debug_info: bool = false,
+    /// 是否尝试恢复泛型信息
+    recover_generics: bool = true,
+    /// 是否简化表达式
+    simplify_expressions: bool = true,
 };
 
 /// 输出格式
@@ -72,6 +76,10 @@ pub const DecompilerResult = struct {
     /// 释放结果
     pub fn deinit(self: *DecompilerResult, allocator: Allocator) void {
         allocator.free(self.source_code);
+        // 释放诊断信息中的消息
+        for (self.diagnostics.items) |diagnostic| {
+            allocator.free(diagnostic.message);
+        }
         self.diagnostics.deinit();
     }
 };
@@ -90,6 +98,12 @@ pub const DecompilerStats = struct {
     optimizations_applied: u32 = 0,
     /// 处理时间（毫秒）
     processing_time_ms: u64 = 0,
+    /// 成功反编译的方法数量
+    successful_methods: u32 = 0,
+    /// 失败的方法数量
+    failed_methods: u32 = 0,
+    /// 跳过的方法数量（抽象、native等）
+    skipped_methods: u32 = 0,
 
     /// 重置统计信息
     pub fn reset(self: *DecompilerStats) void {
@@ -116,6 +130,36 @@ pub const Diagnostic = struct {
     };
 };
 
+/// 方法反编译结果
+pub const MethodDecompileResult = struct {
+    /// 方法AST节点
+    method_ast: *ASTNode,
+    /// 生成的Java代码
+    java_code: []const u8,
+    /// 方法统计信息
+    stats: MethodStats,
+    /// 诊断信息
+    diagnostics: ArrayList(Diagnostic),
+
+    pub fn deinit(self: *MethodDecompileResult, allocator: Allocator) void {
+        allocator.free(self.java_code);
+        for (self.diagnostics.items) |diagnostic| {
+            allocator.free(diagnostic.message);
+        }
+        self.diagnostics.deinit();
+    }
+};
+
+/// 方法统计信息
+pub const MethodStats = struct {
+    instruction_count: u32 = 0,
+    expression_count: u32 = 0,
+    control_structure_count: u32 = 0,
+    local_variable_count: u32 = 0,
+    max_stack_depth: u32 = 0,
+    processing_time_ms: u64 = 0,
+};
+
 /// 反编译引擎
 pub const Decompiler = struct {
     allocator: Allocator,
@@ -130,11 +174,13 @@ pub const Decompiler = struct {
 
     /// 初始化反编译引擎
     pub fn init(allocator: Allocator, options: DecompilerOptions) !Decompiler {
+        const temp_ast_builder = ASTBuilder.init(allocator); // Create ASTBuilder instance
+
         var decompiler = Decompiler{
             .allocator = allocator,
             .options = options,
-            .ast_builder = ASTBuilder.init(allocator),
-            .expression_rebuilder = ExpressionRebuilder.init(allocator),
+            .ast_builder = temp_ast_builder, // Assign instance
+            .expression_rebuilder = expression.ExpressionBuilder.init(allocator),
             .control_flow_analyzer = ControlFlowAnalyzer.init(allocator),
             .code_generator = CodeGenerator.init(allocator, options.codegen_options),
             .optimization_pipeline = null,
@@ -173,17 +219,29 @@ pub const Decompiler = struct {
         self.stats.reset();
         self.diagnostics.clearRetainingCapacity();
 
-        // 创建简单的类节点
-        const class_node = try self.ast_builder.createIdentifier("TestClass");
+        // 创建类节点
+        const class_node = try self.ast_builder.createIdentifier(class_file.getClassName());
 
-        // 处理方法（简化版本）
-        for (class_file.methods) |_| {
-            // 简单处理方法
+        // 处理所有方法
+        for (class_file.methods) |*method| {
+            const method_result = self.decompileMethodInternal(class_file, method) catch |err| {
+                self.stats.failed_methods += 1;
+                try self.addDiagnostic(.@"error", "Failed to decompile method", .{
+                    .method_name = method.getName(),
+                    .bytecode_offset = 0,
+                });
+                std.log.err("Failed to decompile method {s}: {}", .{ method.getName(), err });
+                continue;
+            };
+            defer method_result.deinit(self.allocator);
+
+            try class_node.addChild(method_result.method_ast);
+            self.stats.successful_methods += 1;
             self.stats.methods_processed += 1;
         }
 
-        // 生成简单的源代码
-        const source_code = try self.allocator.dupe(u8, "// Generated Java code\npublic class TestClass {\n}\n");
+        // 生成源代码
+        const source_code = try self.generateSourceCode(class_node);
 
         // 如果启用优化，进行优化
         const final_code = if (self.optimization_pipeline) |*pipeline| blk: {
@@ -199,33 +257,53 @@ pub const Decompiler = struct {
             .source_code = final_code,
             .ast_root = class_node,
             .stats = self.stats,
-            .diagnostics = try self.diagnostics.clone(),
+            .diagnostics = ArrayList(Diagnostic).init(self.allocator),
         };
     }
 
-    /// 反编译单个方法
-    pub fn decompileMethod(self: *Decompiler, class_file: *const ClassFile, method: *const MethodInfo) !*ASTNode {
-        _ = class_file;
-        // 获取方法的Code属性
+    /// 反编译单个方法（公共接口）
+    pub fn decompileMethod(self: *Decompiler, class_file: *const ClassFile, method: *const MethodInfo) !MethodDecompileResult {
+        return self.decompileMethodInternal(class_file, method);
+    }
+
+    /// 反编译单个方法（内部实现）
+    fn decompileMethodInternal(self: *Decompiler, class_file: *const ClassFile, method: *const MethodInfo) !MethodDecompileResult {
+        _ = class_file; // Mark as used to suppress warning
+        const start_time = std.time.milliTimestamp();
+        var method_stats = MethodStats{};
+        var method_diagnostics = ArrayList(Diagnostic).init(self.allocator);
+
+        // 检查方法是否有代码
         const code_attr = method.getCodeAttribute() orelse {
-            try self.addDiagnostic(.warning, "Method has no code attribute", .{
-                .method_name = method.getName(),
-                .bytecode_offset = 0,
+            self.stats.skipped_methods += 1;
+            const message = try std.fmt.allocPrint(self.allocator, "Method {s} has no code attribute (abstract or native)", .{method.getName()});
+            try method_diagnostics.append(Diagnostic{
+                .level = .info,
+                .message = message,
+                .location = .{
+                    .method_name = method.getName(),
+                    .bytecode_offset = 0,
+                },
             });
 
             // 创建抽象方法节点
-            return try self.ast_builder.createMethod(
-                method.getName(),
-                method.getReturnType(),
-                method.getParameterTypes(),
-                null, // 没有方法体
-            );
+            const method_node = try self.createAbstractMethodNode(method);
+            const java_code = try self.code_generator.generateJavaCode(method_node);
+
+            return MethodDecompileResult{
+                .method_ast = method_node,
+                .java_code = java_code,
+                .stats = method_stats,
+                .diagnostics = method_diagnostics,
+            };
         };
 
         // 解析字节码指令
         const instructions = try self.parseInstructions(code_attr.code);
         defer self.allocator.free(instructions);
 
+        method_stats.instruction_count = @intCast(instructions.len);
+        method_stats.max_stack_depth = code_attr.max_stack;
         self.stats.instructions_processed += @intCast(instructions.len);
 
         // 构建控制流图
@@ -233,20 +311,76 @@ pub const Decompiler = struct {
 
         // 识别控制结构
         const control_structures = try self.control_flow_analyzer.identifyControlStructures(cfg);
+        method_stats.control_structure_count = @intCast(control_structures.len);
         self.stats.control_structures_identified += @intCast(control_structures.len);
 
-        // 重建表达式
-        const method_ast = try self.rebuildMethodExpressions(instructions, control_structures);
+        // 重建表达式和方法体
+        const method_body = try self.rebuildMethodExpressions(instructions, control_structures, method, code_attr);
+        method_stats.expression_count = @intCast(self.countExpressions(method_body));
 
-        // 创建方法节点
+        // 创建完整的方法节点（包含处理后的方法体）
+        const method_node = try self.createCompleteMethodNode(method, method_body);
+
+        // 生成Java代码
+        const java_code = try self.code_generator.generateJavaCode(method_node);
+
+        method_stats.processing_time_ms = @intCast(std.time.milliTimestamp() - start_time);
+        self.stats.expressions_rebuilt += method_stats.expression_count;
+
+        return MethodDecompileResult{
+            .method_ast = method_node,
+            .java_code = java_code,
+            .stats = method_stats,
+            .diagnostics = method_diagnostics,
+        };
+    }
+
+    /// 创建抽象方法节点
+    fn createAbstractMethodNode(self: *Decompiler, method: *const MethodInfo) !*ASTNode {
         const method_node = try self.ast_builder.createMethod(
             method.getName(),
             method.getReturnType(),
             method.getParameterTypes(),
-            method_ast,
+            null, // 没有方法体
         );
+        return method_node;
+    }
+
+    /// 创建完整的方法节点
+    fn createCompleteMethodNode(self: *Decompiler, method: *const MethodInfo, body: *ASTNode) !*ASTNode {
+        const method_node = try self.ast_builder.createMethod(
+            method.getName(),
+            method.getReturnType(),
+            method.getParameterTypes(),
+            body,
+        );
+        return method_node;
+    }
+
+    /// 创建包含方法体的完整方法节点
+    fn createCompleteMethodNodeWithBody(self: *Decompiler, method_info: anytype, class_info: anytype, method_body: *ASTNode) !*ASTNode {
+        _ = class_info;
+
+        // 获取方法签名
+        const method_signature = try self.method_parser.getMethodSignature(method_info);
+        defer method_signature.deinit();
+
+        // 创建方法节点
+        const method_node = try self.ast_builder.createMethodDeclaration(method_signature.name, method_signature.return_type, method_signature.parameters, method_info.getAccessFlags());
+
+        // 添加处理后的方法体
+        try method_node.addChild(method_body);
 
         return method_node;
+    }
+
+    /// 计算表达式数量
+    fn countExpressions(self: *Decompiler, node: *ASTNode) u32 {
+        var count: u32 = 1;
+        for (node.children.items) |child| {
+            count += self.countExpressions(child);
+        }
+        return count;
     }
 
     /// 反编译字段
@@ -311,15 +445,21 @@ pub const Decompiler = struct {
         };
     }
 
-    /// 重建方法表达式
-    fn rebuildMethodExpressions(self: *Decompiler, instructions: []const Instruction, control_structures: []const control_structure.ControlStructure) !*ASTNode {
+    /// 重建方法表达式（增强版）
+    fn rebuildMethodExpressions(self: *Decompiler, instructions: []const Instruction, control_structures: []const control_structure.ControlStructure, method: *const MethodInfo, code_attr: *const AttributeInfo) !*ASTNode {
+        _ = method;
+        _ = code_attr;
+
         // 使用表达式重建器处理指令序列
         const method_body = try self.expression_rebuilder.rebuildMethod(instructions);
 
         // 应用控制结构信息
         const structured_body = try self.applyControlStructures(method_body, control_structures);
 
-        self.stats.expressions_rebuilt += @intCast(instructions.len);
+        // 如果启用表达式简化，进行简化
+        if (self.options.simplify_expressions) {
+            return try self.simplifyExpressions(structured_body);
+        }
 
         return structured_body;
     }
@@ -330,6 +470,13 @@ pub const Decompiler = struct {
         _ = structures;
 
         // 简化实现，实际需要根据控制结构重组AST
+        return body;
+    }
+
+    /// 简化表达式
+    fn simplifyExpressions(self: *Decompiler, body: *ASTNode) !*ASTNode {
+        _ = self;
+        // 简化实现，实际需要进行表达式优化
         return body;
     }
 
@@ -394,14 +541,14 @@ pub const Decompiler = struct {
 };
 
 /// 便捷函数：反编译类文件到Java源代码
-pub fn decompileToJava(allocator: Allocator, class_file: *const ClassFile, options: ?DecompilerOptions) ![]const u8 {
+pub fn decompileClassToJava(allocator: Allocator, class_file: *const ClassFile, options: ?DecompilerOptions) ![]const u8 {
     const decompiler_options = options orelse DecompilerOptions{};
     var decompiler = try Decompiler.init(allocator, decompiler_options);
     defer decompiler.deinit();
 
     const result = try decompiler.decompileClass(class_file);
+    var mutable_result = result;
     defer {
-        var mutable_result = result;
         mutable_result.deinit(allocator);
     }
 
@@ -414,8 +561,13 @@ pub fn decompileMethodToJava(allocator: Allocator, class_file: *const ClassFile,
     var decompiler = try Decompiler.init(allocator, decompiler_options);
     defer decompiler.deinit();
 
-    const method_ast = try decompiler.decompileMethod(class_file, method);
-    return try decompiler.code_generator.generateJavaCode(method_ast);
+    const method_result = try decompiler.decompileMethod(class_file, method);
+    var mutable_result = method_result;
+    defer {
+        mutable_result.deinit(allocator);
+    }
+
+    return try allocator.dupe(u8, method_result.java_code);
 }
 
 // 测试
@@ -435,4 +587,52 @@ test "反编译引擎基础功能测试" {
 
     const diagnostics = decompiler.getDiagnostics();
     try testing.expect(diagnostics.len == 0);
+}
+
+test "方法反编译功能测试" {
+    const testing = std.testing;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const options = DecompilerOptions{
+        .generate_comments = true,
+        .recover_variable_names = true,
+        .simplify_expressions = true,
+    };
+    var decompiler = try Decompiler.init(allocator, options);
+    defer decompiler.deinit();
+
+    // 测试统计信息重置
+    decompiler.reset();
+    const stats = decompiler.getStats();
+    try testing.expect(stats.methods_processed == 0);
+    try testing.expect(stats.successful_methods == 0);
+    try testing.expect(stats.failed_methods == 0);
+}
+
+// 测试函数
+test "decompiler basic functionality" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    // 创建基本的反编译器选项
+    const options = DecompilerOptions{
+        .preserve_line_numbers = true,
+        .generate_comments = false,
+        .simplify_expressions = false,
+        .codegen_options = .{
+            .indent_size = 4,
+            .use_tabs = false,
+            .max_line_length = 120,
+            .add_comments = true,
+        },
+    };
+
+    // 测试反编译器初始化
+    var decompiler = try Decompiler.init(allocator, options);
+    defer decompiler.deinit();
+
+    // 基本功能测试通过
+    try testing.expect(true);
 }

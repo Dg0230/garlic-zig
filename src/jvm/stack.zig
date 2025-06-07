@@ -326,6 +326,27 @@ pub const OperandStack = struct {
         try self.push(value2);
     }
 
+    /// 打印栈状态
+    pub fn print(self: *const OperandStack, writer: anytype) !void {
+        try writer.print("  Size: {d}/{d}\n", .{ self.size(), self.max_size });
+        if (self.isEmpty()) {
+            try writer.print("  (empty)\n", .{});
+            return;
+        }
+
+        for (self.values.items, 0..) |value, i| {
+            try writer.print("  [{d}]: ", .{i});
+            switch (value) {
+                .int => |v| try writer.print("int({d})\n", .{v}),
+                .long => |v| try writer.print("long({d})\n", .{v}),
+                .float => |v| try writer.print("float({d})\n", .{v}),
+                .double => |v| try writer.print("double({d})\n", .{v}),
+                .reference => |v| try writer.print("ref({any})\n", .{v}),
+                .return_address => |v| try writer.print("ret_addr({d})\n", .{v}),
+            }
+        }
+    }
+
     /// 弹出栈顶元素（忽略值）
     pub fn popIgnore(self: *OperandStack) !void {
         _ = try self.pop();

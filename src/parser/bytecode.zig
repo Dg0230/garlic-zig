@@ -93,6 +93,35 @@ pub const MethodInfo = struct {
     descriptor_index: u16,
     attributes_count: u16,
     attributes: []AttributeInfo,
+
+    /// 获取方法名称（占位符实现）
+    pub fn getName(self: *const MethodInfo) []const u8 {
+        _ = self;
+        return "method";
+    }
+
+    /// 获取返回类型（占位符实现）
+    pub fn getReturnType(self: *const MethodInfo) []const u8 {
+        _ = self;
+        return "void";
+    }
+
+    /// 获取参数类型（占位符实现）
+    pub fn getParameterTypes(self: *const MethodInfo) [][]const u8 {
+        _ = self;
+        return &[_][]const u8{};
+    }
+
+    /// 获取Code属性（占位符实现）
+    pub fn getCodeAttribute(self: *const MethodInfo) ?*const CodeAttribute {
+        _ = self;
+        return null;
+    }
+};
+
+/// Code属性结构（占位符）
+pub const CodeAttribute = struct {
+    code: []const u8,
 };
 
 /// 属性信息

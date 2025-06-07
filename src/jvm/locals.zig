@@ -107,6 +107,34 @@ pub const LocalVariableTable = struct {
         }
     }
 
+    /// 打印局部变量表状态
+    pub fn print(self: *const LocalVariableTable, writer: anytype) !void {
+        try writer.print("  Max locals: {d}\n", .{self.max_locals});
+
+        var has_initialized = false;
+        for (self.slots, 0..) |slot, i| {
+            if (slot.state == .initialized) {
+                if (!has_initialized) {
+                    try writer.print("  Initialized variables:\n", .{});
+                    has_initialized = true;
+                }
+                try writer.print("    [{d}]: ", .{i});
+                switch (slot.value) {
+                    .int => |v| try writer.print("int({d})\n", .{v}),
+                    .long => |v| try writer.print("long({d})\n", .{v}),
+                    .float => |v| try writer.print("float({d})\n", .{v}),
+                    .double => |v| try writer.print("double({d})\n", .{v}),
+                    .reference => |v| try writer.print("ref({any})\n", .{v}),
+                    .return_address => |v| try writer.print("ret_addr({d})\n", .{v}),
+                }
+            }
+        }
+
+        if (!has_initialized) {
+            try writer.print("  (no initialized variables)\n", .{});
+        }
+    }
+
     /// 设置局部变量值
     pub fn set(self: *LocalVariableTable, index: usize, value: StackValue) !void {
         if (!self.isValidIndex(index)) {
